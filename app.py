@@ -45,11 +45,24 @@ def run_plan(scenario: Scenario, mode: str = "optimise", target: str = "A", shar
 
 
 def zone_color(severity: float) -> str:
+    """Returns color based on zone severity status: Red, Orange, Yellow, Green."""
     if severity >= 80:
-        return "#ff4d5d"
-    if severity >= 55:
-        return "#ffaf3d"
-    return "#45dca2"
+        return "#ff4d5d"  # Red: Critical
+    if severity >= 60:
+        return "#ffaf3d"  # Orange: Strained
+    if severity >= 40:
+        return "#f7d070"  # Yellow: Elevated Warning
+    return "#45dca2"      # Green: Stabilising
+
+
+def get_zone_status_label(severity: float) -> str:
+    if severity >= 80:
+        return "RED (Critical)"
+    if severity >= 60:
+        return "ORANGE (Strained)"
+    if severity >= 40:
+        return "YELLOW (Warning)"
+    return "GREEN (Stabilising)"
 
 
 def map_figure(snapshot: dict) -> go.Figure:
@@ -59,11 +72,12 @@ def map_figure(snapshot: dict) -> go.Figure:
     for zone in ZONES:
         data = snapshot["zones"][zone]
         x, y = positions[zone]
+        status_text = get_zone_status_label(data["severity"])
         fig.add_trace(go.Scatter(
             x=[x], y=[y], mode="markers+text", text=[f"<b>ZONE {zone}</b><br>{data['people_in_danger']:,} at risk"],
             textposition="bottom center", textfont=dict(color="#e9f2f5", size=13),
             marker=dict(size=76, color=zone_color(data["severity"]), line=dict(color="#eaf7f4", width=2)),
-            hovertemplate=f"<b>Zone {zone}</b><br>Severity: {data['severity']:.0f}/100<br>Road access: {'Open' if data['road_access'] else 'Blocked'}<br>Rescued this hour: {data['rescued_this_hour']:,}<extra></extra>",
+            hovertemplate=f"<b>Zone {zone}</b><br>Status: {status_text}<br>Severity: {data['severity']:.0f}/100<br>Road access: {'Open' if data['road_access'] else 'Blocked'}<br>Rescued this hour: {data['rescued_this_hour']:,}<extra></extra>",
         ))
     fig.update_layout(height=390, margin=dict(l=5, r=5, t=20, b=25), paper_bgcolor="#0d2432", plot_bgcolor="#0d2432", showlegend=False,
                       xaxis=dict(visible=False, range=[-.65, 3.45]), yaxis=dict(visible=False, range=[-.6, 1.7], scaleanchor="x", scaleratio=1))
@@ -105,6 +119,20 @@ snapshot = forecast[hour - 1]
 
 st.markdown("""<div class="hero"><div class="eyebrow">AI DISASTER CONSEQUENCE SIMULATOR</div><h1>See the consequences before they happen.</h1><p>Model response options in real time, then act on the safest future.</p><span class="status">● LIVE WORLD MODEL</span></div>""", unsafe_allow_html=True)
 
+# Popup / Evacuation alert checking
+zones_needing_evacuation = [
+    z for z, data in snapshot["zones"].items() 
+    if data["severity"] >= 80 or (data["severity"] >= 60 and not data["road_access"])
+]
+
+if zones_needing_evacuation:
+    st.error(
+        f"🚨 **IMMEDIATE RELOCATION REQUIRED**: Zone(s) {', '.join(zones_needing_evacuation)} "
+        f"are in a critical condition (Severity ≥ 80 or roads blocked with high risk). Issue emergency evacuation orders immediately!"
+    )
+else:
+    st.info("ℹ️ **NO IMMEDIATE RELOCATION REQUIRED**: Evacuation thresholds have not been breached for the current forecast hour.")
+
 top_a, top_b, top_c, top_d = st.columns(4)
 top_a.metric("People rescued", f"{snapshot['cumulative_rescued']:,}", f"by hour {hour}")
 top_b.metric("People still at risk", f"{sum(z['people_in_danger'] for z in snapshot['zones'].values()):,}")
@@ -117,7 +145,7 @@ with left:
     st.select_slider("Forecast time", options=list(range(1, 13)), value=hour, format_func=lambda h: f"Hour {h}", key="map_hour")
     snapshot = forecast[st.session_state.map_hour - 1]
     st.plotly_chart(map_figure(snapshot), use_container_width=True, config={"displayModeBar": False})
-    st.caption("Green = stabilising · Orange = strained · Red = critical. Hover a zone for operational details.")
+    st.caption("🔴 Red = Critical · 🟠 Orange = Strained · 🟡 Yellow = Warning · 🟢 Green = Stabilising. Hover a zone for operational details.")
 with right:
     st.markdown("### Current plan")
     st.dataframe(allocation_table(result["allocation"]), hide_index=True, use_container_width=True)
