@@ -1,7 +1,7 @@
 """MIRROR's deterministic world model, forecaster, and allocation optimiser.
 
 The engine deliberately contains no LLM calls: every number rendered by the
-interface is traceable to the rules below.  A language model can safely be
+interface is traceable to the rules below. A language model can safely be
 added later as a presentation layer without influencing the calculation.
 """
 
@@ -36,6 +36,17 @@ def _round(value: float) -> int:
     return int(value + 0.5)
 
 
+def get_severity_status(severity: float) -> str:
+    """Categorises severity into 4 operational color codes: Red, Orange, Yellow, Green."""
+    if severity >= 80:
+        return "RED"
+    if severity >= 60:
+        return "ORANGE"
+    if severity >= 40:
+        return "YELLOW"
+    return "GREEN"
+
+
 def build_world(s: Scenario) -> dict:
     """Create entities and initial state from the command panel inputs."""
     disaster_factor = {"Flood": 1.0, "Cyclone": 1.12, "Earthquake": 1.28, "Wildfire": 0.88}[s.disaster]
@@ -48,10 +59,12 @@ def build_world(s: Scenario) -> dict:
     zones = {}
     for zone, weight in weights.items():
         pop = _round(s.population * weight)
+        sev_val = min(95, severity[zone] + _round(s.weather_intensity * 2.4) + (12 if not accessibility[zone] else 0))
         zones[zone] = {
             "population": pop,
             "people_in_danger": _round(pop * risk_rate * (1.18 if zone == "C" else 1)),
-            "severity": min(95, severity[zone] + _round(s.weather_intensity * 2.4) + (12 if not accessibility[zone] else 0)),
+            "severity": sev_val,
+            "status": get_severity_status(sev_val),
             "road_access": accessibility[zone],
             "flood_depth": round(0.25 + s.weather_intensity * 0.12 + (0.35 if zone == "C" else 0), 1),
         }
@@ -150,16 +163,44 @@ def simulate(world: dict, allocation: Mapping[str, Mapping[str, int]], hours: in
                 z["severity"] = min(100, z["severity"] + 3.5)
             else:
                 z["severity"] = max(0, z["severity"] - rescued * 0.045)
+            
+            # Update live zone status code based on dynamic severity calculation
+            z["status"] = get_severity_status(z["severity"])
+
         cumulative += sum(rescued_per_zone.values())
         for hospital_id, hospital in state["hospitals"].items():
             incoming = _round(sum(rescued_per_zone[z] for z in hospital["serves"]) * 0.24)
             ambulances = sum(allocation[z]["ambulances"] for z in hospital["serves"] if state["zones"][z]["road_access"])
             discharged = _round(hospital["load"] * 0.055) + ambulances * 6
             hospital["load"] = max(0, min(hospital["capacity"], hospital["load"] + incoming - discharged))
+            
         zone_view = {z: {**data, "rescued_this_hour": rescued_per_zone[z]} for z, data in state["zones"].items()}
         hospital_view = {h: {**data, "load_percent": _round(100 * data["load"] / data["capacity"])} for h, data in state["hospitals"].items()}
+        
+        # Color & Evacuation Condition Classifications
         critical = [z for z, data in zone_view.items() if data["severity"] >= 80]
-        snapshots.append({"hour": hour, "cumulative_rescued": cumulative, "zones": deepcopy(zone_view), "hospitals": deepcopy(hospital_view), "critical_zones": critical})
+        strained = [z for z, data in zone_view.items() if 60 <= data["severity"] < 80]
+        warning = [z for z, data in zone_view.items() if 40 <= data["severity"] < 60]
+        stabilising = [z for z, data in zone_view.items() if data["severity"] < 40]
+
+        # Evacuation flag: True if severity >= 80 (Red) or if severity >= 60 (Orange) with no road access
+        evacuation_zones = [
+            z for z, data in zone_view.items() 
+            if data["severity"] >= 80 or (data["severity"] >= 60 and not data["road_access"])
+        ]
+        
+        snapshots.append({
+            "hour": hour,
+            "cumulative_rescued": cumulative,
+            "zones": deepcopy(zone_view),
+            "hospitals": deepcopy(hospital_view),
+            "critical_zones": critical,
+            "strained_zones": strained,
+            "warning_zones": warning,
+            "stabilising_zones": stabilising,
+            "evacuation_required": len(evacuation_zones) > 0,
+            "evacuation_zones": evacuation_zones,
+        })
     return snapshots
 
 
@@ -169,8 +210,15 @@ def plan_summary(world: dict, allocation: dict, forecast: List[dict]) -> List[st
     constrained = [z for z in ZONES if not world["zones"][z]["road_access"]]
     hospital = max(final["hospitals"].items(), key=lambda item: item[1]["load_percent"])
     access_note = f"Zone {constrained[0]} is road-isolated, so boats are its primary lifeline." if constrained else "All zones retain road access for ground teams and ambulances."
-    return [
+    
+    summary = [
         f"Prioritise Zone {highest}: it begins with the highest combined hazard and demand score.",
         access_note,
         f"At hour 12, {hospital[0]} is projected at {hospital[1]['load_percent']}% capacity; keep diversion and triage ready above 85%.",
     ]
+    
+    # Append evacuation warnings if active in forecast
+    if final["evacuation_required"]:
+        summary.append(f"⚠️ Evacuation Warning: Zone(s) {', '.join(final['evacuation_zones'])} require immediate relocation order.")
+        
+    return summary
